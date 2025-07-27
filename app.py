@@ -238,7 +238,7 @@ def extract_front_cnic_info(text):
                 info['Gender'] = gender
             break
     
-    # Extract dates in format XX.XX.XXXX
+    # Extract dates in format XX.XX.XXXX or XX/XX/XXXX or XX-XX-XXXX
     date_pattern = r'\b(\d{1,2}[./-]\d{1,2}[./-]\d{4})\b'
     dates_found = re.findall(date_pattern, text)
     
@@ -254,6 +254,8 @@ def extract_front_cnic_info(text):
             formatted_date = f"{day.zfill(2)}.{month.zfill(2)}.{year}"
             formatted_dates.append(formatted_date)
     
+    logger.info(f"Found dates: {formatted_dates}")
+    
     # Assign dates based on context and position
     if formatted_dates:
         # Look for specific date contexts
@@ -261,41 +263,155 @@ def extract_front_cnic_info(text):
         issue_found = False
         expiry_found = False
         
+        # Sort dates by year for better analysis
+        sorted_dates = sorted(formatted_dates, key=lambda x: int(x.split('.')[2]))
+        logger.info(f"Sorted dates by year: {sorted_dates}")
+        
         for i, line in enumerate(text_lines):
             line_upper = line.upper()
-            if 'BIRTH' in line_upper or 'DOB' in line_upper:
+            # Enhanced date of birth detection
+            if ('BIRTH' in line_upper or 'DOB' in line_upper or 'BORN' in line_upper) and not birth_found:
                 for date in formatted_dates:
                     if date in line or any(part in line for part in date.split('.')):
                         info['Date of Birth'] = date
                         birth_found = True
+                        logger.info(f"Found Date of Birth from context: {date}")
                         break
-            elif 'ISSUE' in line_upper in line_upper:
+            # Issue date detection - more specific patterns
+            elif ('ISSUE' in line_upper or 'ISSUED' in line_upper or 'DATE OF ISSUE' in line_upper) and not issue_found:
                 for date in formatted_dates:
                     if date in line or any(part in line for part in date.split('.')):
                         info['Date of Issue'] = date
                         issue_found = True
+                        logger.info(f"Found Date of Issue from context: {date}")
                         break
-            elif 'EXPIRY' in line_upper or 'EXPIRE' in line_upper or 'VALID' in line_upper:
+            # Expiry date detection - more specific patterns
+            elif ('EXPIRY' in line_upper or 'EXPIRE' in line_upper or 'VALID' in line_upper or 'DATE OF EXPIRY' in line_upper) and not expiry_found:
                 for date in formatted_dates:
                     if date in line or any(part in line for part in date.split('.')):
                         info['Date of Expiry'] = date
                         expiry_found = True
+                        logger.info(f"Found Date of Expiry from context: {date}")
                         break
         
-        # If context-based assignment didn't work, assign by typical order
-        remaining_dates = [d for d in formatted_dates]
+        # Create a list of remaining dates that haven't been assigned
+        assigned_dates = [info['Date of Birth'], info['Date of Issue'], info['Date of Expiry']]
+        remaining_dates = [d for d in formatted_dates if d not in assigned_dates]
+        
+        # Smart assignment for missing dates based on Pakistani CNIC patterns
         if not birth_found and remaining_dates:
-            # Birth date is usually the earliest year
-            birth_date = min(remaining_dates, key=lambda x: int(x.split('.')[2]))
-            info['Date of Birth'] = birth_date
-            remaining_dates.remove(birth_date)
+            # Birth date is usually the earliest year (person's birth)
+            birth_candidates = [d for d in remaining_dates if int(d.split('.')[2]) < 2010]  # Born before 2010
+            if birth_candidates:
+                birth_date = min(birth_candidates, key=lambda x: int(x.split('.')[2]))
+                # Additional validation: birth year should be reasonable
+                birth_year = int(birth_date.split('.')[2])
+                current_year = datetime.now().year
+                if 1900 <= birth_year <= current_year - 5:  # At least 5 years old
+                    info['Date of Birth'] = birth_date
+                    remaining_dates.remove(birth_date)
+                    logger.info(f"Assigned Date of Birth by year logic: {birth_date}")
         
-        if not issue_found and remaining_dates:
-            info['Date of Issue'] = remaining_dates[0]
-            remaining_dates.remove(remaining_dates[0])
+        # Update remaining dates after birth assignment
+        assigned_dates = [info['Date of Birth'], info['Date of Issue'], info['Date of Expiry']]
+        remaining_dates = [d for d in formatted_dates if d not in assigned_dates]
         
-        if not expiry_found and remaining_dates:
-            info['Date of Expiry'] = remaining_dates[0]
+        # For Pakistani CNICs: Issue date is typically when the card was issued (recent years)
+        # Expiry date is typically 5-10 years after issue date
+        if len(remaining_dates) >= 2:
+            # Sort remaining dates by year
+            remaining_sorted = sorted(remaining_dates, key=lambda x: int(x.split('.')[2]))
+            
+            if not issue_found and not expiry_found:
+                # If we have 2 dates left, the earlier one is usually issue, later is expiry
+                # But Pakistani CNICs: issue dates are typically 2012 onwards (new format)
+                issue_candidates = [d for d in remaining_sorted if int(d.split('.')[2]) >= 2012]
+                
+                if len(issue_candidates) >= 2:
+                    # Take the earlier of the candidates as issue date
+                    info['Date of Issue'] = issue_candidates[0]
+                    info['Date of Expiry'] = issue_candidates[1]
+                    logger.info(f"Assigned Date of Issue: {issue_candidates[0]}, Date of Expiry: {issue_candidates[1]}")
+                elif len(issue_candidates) == 1:
+                    info['Date of Issue'] = issue_candidates[0]
+                    # Find expiry date (should be later)
+                    expiry_candidates = [d for d in remaining_sorted if int(d.split('.')[2]) > int(issue_candidates[0].split('.')[2])]
+                    if expiry_candidates:
+                        info['Date of Expiry'] = expiry_candidates[0]
+                    elif remaining_dates:
+                        # Fallback: use any remaining date
+                        other_dates = [d for d in remaining_dates if d != issue_candidates[0]]
+                        if other_dates:
+                            info['Date of Expiry'] = other_dates[0]
+                    logger.info(f"Assigned Date of Issue: {issue_candidates[0]}, Date of Expiry: {info['Date of Expiry']}")
+                else:
+                    # Fallback: assign by chronological order
+                    if len(remaining_sorted) >= 2:
+                        info['Date of Issue'] = remaining_sorted[0]
+                        info['Date of Expiry'] = remaining_sorted[1]
+                        logger.info(f"Fallback assignment - Issue: {remaining_sorted[0]}, Expiry: {remaining_sorted[1]}")
+            
+            elif not issue_found:
+                # Only issue date missing
+                if remaining_dates:
+                    # Find a date that could be an issue date (not too old, not in future)
+                    current_year = datetime.now().year
+                    issue_candidates = [d for d in remaining_dates if 2012 <= int(d.split('.')[2]) <= current_year]
+                    if issue_candidates:
+                        # If we have expiry date, issue should be before expiry
+                        if info['Date of Expiry']:
+                            expiry_year = int(info['Date of Expiry'].split('.')[2])
+                            valid_issues = [d for d in issue_candidates if int(d.split('.')[2]) <= expiry_year]
+                            if valid_issues:
+                                info['Date of Issue'] = valid_issues[0]
+                            else:
+                                info['Date of Issue'] = issue_candidates[0]
+                        else:
+                            info['Date of Issue'] = issue_candidates[0]
+                        logger.info(f"Assigned missing Date of Issue: {info['Date of Issue']}")
+            
+            elif not expiry_found:
+                # Only expiry date missing
+                if remaining_dates:
+                    # Expiry date should be after issue date
+                    if info['Date of Issue']:
+                        issue_year = int(info['Date of Issue'].split('.')[2])
+                        expiry_candidates = [d for d in remaining_dates if int(d.split('.')[2]) >= issue_year]
+                        if expiry_candidates:
+                            # Take the latest reasonable expiry date
+                            info['Date of Expiry'] = max(expiry_candidates, key=lambda x: int(x.split('.')[2]))
+                        else:
+                            info['Date of Expiry'] = remaining_dates[0]
+                    else:
+                        info['Date of Expiry'] = remaining_dates[0]
+                    logger.info(f"Assigned missing Date of Expiry: {info['Date of Expiry']}")
+        
+        elif len(remaining_dates) == 1:
+            # Only one date left to assign
+            if not issue_found:
+                info['Date of Issue'] = remaining_dates[0]
+                logger.info(f"Assigned single remaining date as Issue: {remaining_dates[0]}")
+            elif not expiry_found:
+                info['Date of Expiry'] = remaining_dates[0]
+                logger.info(f"Assigned single remaining date as Expiry: {remaining_dates[0]}")
+        
+        # Final validation: ensure issue date is before expiry date
+        if info['Date of Issue'] and info['Date of Expiry']:
+            issue_parts = info['Date of Issue'].split('.')
+            expiry_parts = info['Date of Expiry'].split('.')
+            
+            # Compare years first, then months, then days
+            issue_year, issue_month, issue_day = int(issue_parts[2]), int(issue_parts[1]), int(issue_parts[0])
+            expiry_year, expiry_month, expiry_day = int(expiry_parts[2]), int(expiry_parts[1]), int(expiry_parts[0])
+            
+            # If issue date is after expiry date, swap them
+            issue_date_obj = datetime(issue_year, issue_month, issue_day)
+            expiry_date_obj = datetime(expiry_year, expiry_month, expiry_day)
+            
+            if issue_date_obj > expiry_date_obj:
+                logger.warning(f"Issue date {info['Date of Issue']} is after expiry date {info['Date of Expiry']}, swapping them")
+                info['Date of Issue'], info['Date of Expiry'] = info['Date of Expiry'], info['Date of Issue']
+                logger.info(f"After swap - Issue: {info['Date of Issue']}, Expiry: {info['Date of Expiry']}")
     
     # Extract Country of Stay
     country_keywords = ['PAKISTAN', 'PAK']
@@ -313,6 +429,9 @@ def extract_front_cnic_info(text):
                 info['Country of Stay'] = country.strip().title()
                 break
     
+    # Log extracted information
+    logger.info(f"Extracted info: {info}")
+    
     return info
 
 def extract_back_cnic_info(text):
@@ -328,7 +447,6 @@ def extract_back_cnic_info(text):
     cnic_number = extract_cnic_number(text)
     if cnic_number:
         info['Identity Number'] = cnic_number
-    
     
     return info
 
@@ -414,27 +532,26 @@ def perform_ocr(image_path):
         return ""
 
 def format_cnic_output(front_info, back_info, cnic_match):
-    """Format the final output"""
+    """Format the final output with Date of Birth prominently included"""
     output_lines = []
     
-    # Front information
+    # Front information - including Date of Birth prominently
     if front_info.get('Name'):
         output_lines.append(f"Name: {front_info['Name']}")
     if front_info.get('Father Name'):
         output_lines.append(f"Father Name: {front_info['Father Name']}")
     if front_info.get('Date of Birth'):
         output_lines.append(f"Date of Birth: {front_info['Date of Birth']}")
+    if front_info.get('Gender'):
+        output_lines.append(f"Gender: {front_info['Gender']}")
+    if front_info.get('Identity Number'):
+        output_lines.append(f"Identity Number: {front_info['Identity Number']}")
     if front_info.get('Date of Issue'):
         output_lines.append(f"Date of Issue: {front_info['Date of Issue']}")
     if front_info.get('Date of Expiry'):
         output_lines.append(f"Date of Expiry: {front_info['Date of Expiry']}")
-    if front_info.get('Gender'):
-        output_lines.append(f"Gender: {front_info['Gender']}")
     if front_info.get('Country of Stay'):
         output_lines.append(f"Country of Stay: {front_info['Country of Stay']}")
-    if front_info.get('Identity Number'):
-        output_lines.append(f"Identity Number: {front_info['Identity Number']}")
-    
     
     # CNIC matching information
     output_lines.append(f"\nCNIC Validation: {cnic_match['message']}")
@@ -448,6 +565,10 @@ def home():
         'message': 'Enhanced CNIC OCR Backend is running',
         'status': 'active',
         'ocr_engine_status': 'initialized' if ocr_engine else 'failed',
+        'supported_fields': [
+            'Name', 'Father Name', 'Date of Birth', 'Gender', 
+            'Identity Number', 'Date of Issue', 'Date of Expiry', 'Country of Stay'
+        ],
         'timestamp': datetime.now().isoformat()
     })
 
